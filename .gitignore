@@ -9,3 +9,4 @@ logs/
 tests/fixtures/alice-images.epub
 .pytest_cache/
 cache/
+build/slice5-shots/

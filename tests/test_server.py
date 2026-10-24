@@ -213,8 +213,12 @@ def test_playback_and_bookmarks(done_book):
     c, b = done_book
     base = f"/api/books/{b['id']}"
     assert c.get(f"{base}/playback").json()["position"] == 0
+    shelf = lambda: next(x for x in c.get("/api/books").json() if x["id"] == b["id"])  # noqa: E731
+    assert shelf()["listened"] is None                       # never played
     assert c.put(f"{base}/playback", json={"chapter": 1, "position": 12.5}).json()["position"] == 12.5
     assert c.get(f"{base}").json()["playback"]["chapter"] == 1
+    ch0 = c.get(f"{base}").json()["chapters"][0]["duration"]
+    assert abs(shelf()["listened"] - (ch0 + 12.5)) < 1e-6    # chapter 0 whole + 12.5 s into chapter 1
     assert c.put(f"{base}/playback", json={"chapter": 99, "position": 1}).status_code == 400
     assert c.put(f"{base}/playback", json={"chapter": 0, "position": -1}).status_code == 400
     assert c.put(f"{base}/playback", json={"chapter": "x"}).status_code == 400
@@ -233,6 +237,7 @@ def test_playback_and_bookmarks(done_book):
 def test_voices_samples_formats_and_page(client):
     v = client.get("/api/voices").json()
     assert any(x["id"] == "af_heart" and "Heart" in x["label"] for x in v)
+    assert all(x["style"] for x in v)                       # every voice has measured style words
     s = client.get("/api/voices/af_heart/sample?speed=1.0")
     assert s.status_code == 200 and s.content[4:8] == b"ftyp"
     cached = list((config.get_settings().cache_dir / "samples").glob("*.m4a"))
@@ -261,7 +266,7 @@ def test_settings_roundtrip_and_donate_url(client, env):
     assert r.status_code == 200
     s = client.get("/api/settings").json()
     assert (s["voice"], s["speed"], s["format"], s["donate_url"], s["llm"]["order"]) == ("bf_emma", 1.25, "mp3", "https://example.org/donate", ["openai", "anthropic"])
-    assert s["watch_inbox"].endswith("/Inbox")
+    assert s["watch_inbox"] == "~/Inbox"            # home folders shown as ~/...
     assert config.get_settings().donate_url == "https://example.org/donate"
     assert client.put("/api/settings", json={"donate_url": "javascript:alert(1)"}).status_code == 400
     assert client.put("/api/settings", json={"voice": "nobody"}).status_code == 400

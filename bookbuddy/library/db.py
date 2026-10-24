@@ -221,7 +221,17 @@ class Library:
             b["chapters_ready"] = self.db.execute("SELECT COUNT(*) FROM chapters WHERE book_id=? AND status='ready'", (b["id"],)).fetchone()[0]
             b["chapters_total"] = self.db.execute("SELECT COUNT(*) FROM chapters WHERE book_id=?", (b["id"],)).fetchone()[0]
             b["job"] = self.latest_job(b["id"])
+            b["listened"] = self._listened(b["id"])
         return books
+
+    def _listened(self, book_id: int) -> float | None:
+        """Seconds listened so far: whole chapters before the saved one + the position in it. None if never played."""
+        pb = self.db.execute("SELECT chapter, position FROM playback WHERE book_id=?", (book_id,)).fetchone()
+        if pb is None:
+            return None
+        before = self.db.execute("SELECT COALESCE(SUM(duration), 0) FROM chapters WHERE book_id=? AND idx<?",
+                                 (book_id, pb[0])).fetchone()[0]
+        return float(before) + float(pb[1])
 
     def set_book(self, book_id: int, **fields) -> None:
         self._update("books", "id=?", (book_id,), fields, self.BOOK_FIELDS)

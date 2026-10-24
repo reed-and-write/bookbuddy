@@ -74,10 +74,11 @@ def stage_path(path: Path) -> tuple[Path, str, int]:
 
 
 def enqueue_file(lib: Library, staged: Path, sha: str, *, origin: str, voice: str, speed: float, fmt: str,
-                 llm: str | None = None, extra: dict | None = None, original_name: str | None = None) -> tuple[int, int]:
+                 llm: str | None = None, extra: dict | None = None, original_name: str | None = None,
+                 title: str | None = None) -> tuple[int, int]:
     """Create the book + queued job for a staged file. `llm`: None = settings, 'auto', 'none' or a provider name."""
     name = original_name or staged.name
-    title = re.sub(r"[_]+", " ", Path(name).stem).strip() or name
+    title = (title or "").strip() or re.sub(r"[_]+", " ", Path(name).stem).strip() or name
     options = {"llm": llm, **(extra or {})}
     return lib.enqueue(title=title, source_name=name, source_hash=sha, source_path=str(staged), voice=voice, speed=speed,
                        fmt=fmt, origin=origin, options=options)

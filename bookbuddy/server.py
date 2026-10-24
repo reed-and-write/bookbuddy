@@ -26,9 +26,10 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__, config, intake, llm_providers  # noqa: F401  (registers anthropic/openai)
+from . import __version__, config, intake, llm_providers, preview  # noqa: F401  (llm_providers registers anthropic/openai)
 from .config_edit import update_config
 from .extractors import list_formats
+from .extractors.drm import DRMError
 from .library import ACTIVE_STATES, Library, LibraryError
 from .logs import register_secret
 from .registry import llm_providers as provider_registry
@@ -44,6 +45,8 @@ COOKIE = "bb_token"
 CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
        "media-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 OPEN_PATHS = {"/api/session", "/api/login"}
+STATIC_TYPES = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".woff2": "font/woff2",
+                ".webp": "image/webp", ".svg": "image/svg+xml", ".txt": "text/plain; charset=utf-8", ".png": "image/png"}
 
 
 def is_loopback(host: str) -> bool:
@@ -75,7 +78,7 @@ def public_book(b: dict, chapters: list[dict] | None = None, lib: Library | None
     op = b.get("output_path")
     out["has_download"] = bool(op and Path(op).exists())
     out["download_kind"] = ("m4b" if op and Path(op).is_file() else "mp3-folder" if op and Path(op).is_dir() else None)
-    for k in ("chapters_ready", "chapters_total"):
+    for k in ("chapters_ready", "chapters_total", "listened"):
         if k in b:
             out[k] = b[k]
     if b.get("job"):
@@ -115,7 +118,18 @@ def create_app(*, library: Library | None = None, worker: Worker | None = None, 
     async def lifespan(app: FastAPI):
         if start_worker:
             worker.start()
+
+        async def sweep():                                   # unclaimed inspected uploads expire after 24 h
+            while True:
+                try:
+                    await run_in_threadpool(preview.cleanup_expired)
+                except Exception:  # noqa: BLE001 - housekeeping must never take the server down
+                    log.exception("upload cleanup failed")
+                await asyncio.sleep(3600)
+
+        sweeper = asyncio.create_task(sweep())
         yield
+        sweeper.cancel()
         if start_worker:
             await run_in_threadpool(worker.stop)
 
@@ -176,6 +190,34 @@ def create_app(*, library: Library | None = None, worker: Worker | None = None, 
     async def index():
         return FileResponse(WEB_DIR / "index.html", media_type="text/html", headers={"Cache-Control": "no-store"})
 
+    def static_file(folder: Path, name: str, cache: str) -> FileResponse:
+        """One file from the packaged web folder. Only plain names that exist as files there are served."""
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", name) or name.startswith("."):
+            raise HTTPException(404, "not found")
+        path = folder / name
+        if not path.is_file():
+            raise HTTPException(404, "not found")
+        media = STATIC_TYPES.get(path.suffix.lower())
+        if media is None:
+            raise HTTPException(404, "not found")
+        return FileResponse(path, media_type=media, headers={"Cache-Control": cache})
+
+    @app.get("/app.css", include_in_schema=False)
+    async def app_css():
+        return static_file(WEB_DIR, "app.css", "no-cache")
+
+    @app.get("/app.js", include_in_schema=False)
+    async def app_js():
+        return static_file(WEB_DIR, "app.js", "no-cache")
+
+    @app.get("/fonts/{name}", include_in_schema=False)
+    async def web_font(name: str):
+        return static_file(WEB_DIR / "fonts", name, "max-age=86400")
+
+    @app.get("/art/{name}", include_in_schema=False)
+    async def web_art(name: str):
+        return static_file(WEB_DIR / "art", name, "max-age=86400")
+
     @app.get("/favicon.ico", include_in_schema=False)
     async def favicon():
         return Response(status_code=204)
@@ -203,32 +245,92 @@ def create_app(*, library: Library | None = None, worker: Worker | None = None, 
         return f
 
     # ------------------------------------------------------------ books
-    @app.post("/api/books", status_code=201)
-    async def upload_book(request: Request, file: UploadFile = File(...), voice: str | None = Form(None),
-                          speed: float | None = Form(None), format: str | None = Form(None), llm: str | None = Form(None)):
+    def read_options(voice, speed, format, llm) -> tuple[str, float, str, str]:
         st = config.get_settings()
-        limit = st.web_max_upload_mb * (1 << 20)
-        clen = request.headers.get("content-length")
-        if clen and clen.isdigit() and int(clen) > limit + (1 << 20):
-            raise HTTPException(413, f"file is larger than the {st.web_max_upload_mb} MB upload limit")
         voice = ok_voice(voice or st.voice)
         speed = ok_speed(speed if speed is not None else st.speed)
         fmt = ok_format(format or st.format)
         mode = (llm or "auto").lower()
         if mode not in ("on", "off", "auto", "none", "true", "false", "1", "0"):
             raise HTTPException(400, "llm must be on or off")
-        llm_choice = "none" if mode in ("off", "none", "false", "0") else "auto"
+        return voice, speed, fmt, ("none" if mode in ("off", "none", "false", "0") else "auto")
+
+    async def stage_upload(request: Request, file: UploadFile) -> tuple[Path, str, int]:
+        st = config.get_settings()
+        limit = st.web_max_upload_mb * (1 << 20)
+        clen = request.headers.get("content-length")
+        if clen and clen.isdigit() and int(clen) > limit + (1 << 20):
+            raise HTTPException(413, f"file is larger than the {st.web_max_upload_mb} MB upload limit")
         try:
-            staged, sha, _ = await run_in_threadpool(intake.stage_stream, file.file, file.filename or "book", limit)
+            return await run_in_threadpool(intake.stage_stream, file.file, file.filename or "book", limit)
         except intake.TooLarge as e:
             raise HTTPException(413, str(e)) from None
         except intake.IntakeError as e:
             raise HTTPException(400, str(e)) from None
-        book_id, job_id = intake.enqueue_file(lib, staged, sha, origin="web", voice=voice, speed=speed, fmt=fmt, llm=llm_choice)
+
+    @app.post("/api/books", status_code=201)
+    async def upload_book(request: Request, file: UploadFile | None = File(None), upload_id: str | None = Form(None),
+                          voice: str | None = Form(None), speed: float | None = Form(None), format: str | None = Form(None),
+                          llm: str | None = Form(None)):
+        """Queue a book: either a new `file`, or an `upload_id` from POST /api/inspect (the staged file is used, once)."""
+        if file is None and upload_id is None:
+            raise HTTPException(422, "send a file or an upload_id")
+        if file is not None and upload_id is not None:
+            raise HTTPException(400, "send either a file or an upload_id, not both")
+        voice, speed, fmt, llm_choice = read_options(voice, speed, format, llm)
+        if upload_id is not None:
+            try:
+                staged, meta = await run_in_threadpool(preview.claim, upload_id)
+            except preview.UploadExpired as e:
+                raise HTTPException(410, str(e)) from None
+            except preview.UploadGone:
+                raise HTTPException(404, "no such upload (it may have been queued or discarded already)") from None
+            sha, shown_title = meta["sha"], meta.get("title")
+        else:
+            staged, sha, _ = await stage_upload(request, file)
+            shown_title = None
+        book_id, job_id = intake.enqueue_file(lib, staged, sha, origin="web", voice=voice, speed=speed, fmt=fmt, llm=llm_choice,
+                                              title=shown_title)
         worker.wake()
         bus.publish("book", book_id=book_id, status="queued")
         bus.publish("job", job=_public_job(lib.get_job(job_id)))
         return {"book_id": book_id, "job_id": job_id}
+
+    # ------------------------------------------------------------ inspect (stage + metadata, no job)
+    @app.post("/api/inspect", status_code=201)
+    async def inspect_book(request: Request, file: UploadFile = File(...), speed: float | None = Form(None)):
+        sp = ok_speed(speed if speed is not None else config.get_settings().speed)
+        staged, sha, size = await stage_upload(request, file)
+        try:
+            return await run_in_threadpool(preview.inspect_upload, staged, sha, size, sp)
+        except (DRMError, ValueError) as e:
+            raise HTTPException(400, str(e) if isinstance(e, DRMError) else f"Book Buddy could not read this file: {e}") from None
+        except Exception as e:  # noqa: BLE001 - a broken file is the user's problem to see, not a 500
+            log.warning("inspect failed for %s: %s", staged.name, e)
+            raise HTTPException(400, "Book Buddy could not read this file.") from None
+
+    @app.get("/api/inspect/{upload_id}/cover")
+    async def inspect_cover(upload_id: str):
+        try:
+            p = await run_in_threadpool(preview.cover_path, upload_id)
+        except preview.UploadExpired as e:
+            raise HTTPException(410, str(e)) from None
+        except preview.UploadGone:
+            raise HTTPException(404, "no such upload") from None
+        if p is None:
+            raise HTTPException(404, "no cover")
+        return FileResponse(p, media_type={".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}.get(p.suffix, "image/jpeg"),
+                            headers={"Cache-Control": "no-store"})
+
+    @app.delete("/api/inspect/{upload_id}")
+    async def inspect_discard(upload_id: str):
+        try:
+            await run_in_threadpool(preview.discard, upload_id)
+        except preview.UploadExpired as e:
+            raise HTTPException(410, str(e)) from None
+        except preview.UploadGone:
+            raise HTTPException(404, "no such upload") from None
+        return {"ok": True}
 
     @app.get("/api/books")
     async def list_books():
@@ -458,11 +560,19 @@ def create_app(*, library: Library | None = None, worker: Worker | None = None, 
         return [r.to_dict() for r in list_formats()]
 
     # ------------------------------------------------------------ settings + keys
+    def home_short(p: Path) -> str:
+        """Show folders under the user's home as ~/... (config expands ~ again on load)."""
+        try:
+            return "~/" + Path(p).expanduser().relative_to(Path.home()).as_posix()
+        except ValueError:
+            return str(p)
+
     def settings_view() -> dict:
         st = config.get_settings()
         return {
             "voice": st.voice, "speed": st.speed, "format": st.format,
-            "output_dir": str(st.output_dir), "watch_inbox": str(st.watch_inbox), "watch_outbox": str(st.outbox),
+            "output_dir": home_short(st.output_dir), "watch_inbox": home_short(st.watch_inbox),
+            "watch_outbox": home_short(st.outbox),
             "donate_url": st.donate_url, "max_upload_mb": st.web_max_upload_mb,
             "llm_enabled": st.llm_enabled,
             "llm": {"enabled": st.llm_enabled, "order": st.llm_order, "available": provider_registry.names(),
