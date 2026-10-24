@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Book Buddy</title>
+<!-- Deliberately bare test page for the API (slice 4). The designed page replaces this later. No build step, no CDN. -->
+<style>
+ body{font:15px/1.4 system-ui,sans-serif;max-width:52rem;margin:1rem auto;padding:0 1rem;color:#222}
+ h1{font-size:1.3rem} h2{font-size:1.05rem;margin-top:1.5rem;border-bottom:1px solid #ccc}
+ fieldset{border:1px solid #ccc;margin:.5rem 0} label{display:inline-block;margin:.2rem .6rem .2rem 0}
+ .book{border:1px solid #ccc;padding:.5rem;margin:.5rem 0} .muted{color:#666;font-size:.9em}
+ progress{width:12rem} li{margin:.15rem 0} button{margin-right:.3rem} .err{color:#a00}
+</style>
+</head>
+<body>
+<h1>Book Buddy</h1>
+<div id="login" hidden>
+  <p>This server needs an access token.</p>
+  <input id="token" type="password" placeholder="token" autocomplete="off"> <button id="loginBtn">Enter</button>
+  <span id="loginErr" class="err"></span>
+</div>
+
+<div id="app" hidden>
+<h2>Add a book</h2>
+<form id="upload">
+  <input type="file" id="file" required>
+  <fieldset>
+    <label>Voice <select id="voice"></select></label>
+    <button type="button" id="hear">Hear it</button> <audio id="sample"></audio>
+    <label>Speed <input id="speed" type="number" min="0.5" max="2" step="0.05" value="1" style="width:4.5rem"></label>
+    <label>Format <select id="format"><option>m4b</option><option>mp3</option></select></label>
+    <label><input id="llm" type="checkbox" checked> LLM cleanup (only with your own key)</label>
+  </fieldset>
+  <button>Upload</button> <span id="upMsg" class="muted"></span>
+</form>
+
+<h2>Library</h2>
+<div id="books"></div>
+
+<h2>Settings</h2>
+<form id="settings">
+  <label>Default voice <select id="sVoice"></select></label>
+  <label>Speed <input id="sSpeed" type="number" min="0.5" max="2" step="0.05" style="width:4.5rem"></label>
+  <label>Format <select id="sFormat"><option>m4b</option><option>mp3</option></select></label><br>
+  <label>Watch folder <input id="sInbox" size="34"></label>
+  <label>Donate link <input id="sDonate" size="34"></label><br>
+  <label>LLM order <input id="sOrder" size="22" placeholder="anthropic,openai"></label>
+  <button>Save settings</button> <span id="sMsg" class="muted"></span>
+</form>
+<h2>API keys <span class="muted">(stored on this machine only; never shown again)</span></h2>
+<div id="keys"></div>
+<p class="muted" id="donate"></p>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+async function api(path, opts = {}) {
+  const r = await fetch(path, {credentials: "same-origin", ...opts});
+  if (r.status === 401) { showLogin(); throw new Error("login"); }
+  if (!r.ok) { let m = r.statusText; try { m = (await r.json()).detail || m; } catch (e) {} throw new Error(m); }
+  return r.status === 204 ? null : r.json();
+}
+const jsonOpts = (method, body) => ({method, headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+function el(tag, props = {}, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) k === "on" ? Object.entries(v).forEach(([ev, f]) => e.addEventListener(ev, f)) : (e[k] = v);
+  kids.forEach(k => e.append(k)); return e;
+}
+function fmtDur(s) { s = Math.round(s || 0); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return h ? `${h}h${String(m).padStart(2,"0")}m` : `${m}m${String(s % 60).padStart(2,"0")}s`; }
+
+function showLogin() { $("login").hidden = false; $("app").hidden = true; }
+$("loginBtn").onclick = async () => {
+  try { await api("/api/login", jsonOpts("POST", {token: $("token").value})); $("login").hidden = true; start(); }
+  catch (e) { $("loginErr").textContent = " wrong token"; }
+};
+
+let voices = [], open = null;
+async function start() {
+  const s = await fetch("/api/session").then(r => r.json());
+  if (s.auth_required && !s.authenticated) return showLogin();
+  $("login").hidden = true; $("app").hidden = false;
+  voices = await api("/api/voices");
+  for (const sel of [$("voice"), $("sVoice")]) { sel.replaceChildren(...voices.map(v => el("option", {value: v.id, textContent: v.label}))); }
+  await loadSettings(); await refresh(); listen();
+}
+
+async function loadSettings() {
+  const s = await api("/api/settings");
+  $("voice").value = $("sVoice").value = s.voice; $("speed").value = $("sSpeed").value = s.speed;
+  $("format").value = $("sFormat").value = s.format; $("sInbox").value = s.watch_inbox; $("sDonate").value = s.donate_url;
+  $("sOrder").value = s.llm.order.join(",");
+  $("donate").replaceChildren("Book Buddy is free. ", el("a", {href: s.donate_url, textContent: "Support the project", rel: "noopener", target: "_blank"}));
+  const keys = $("keys"); keys.replaceChildren();
+  for (const p of ["anthropic", "openai"]) {
+    const k = s.llm.keys[p], inp = el("input", {type: "password", size: 36, placeholder: p + " API key", autocomplete: "off"});
+    keys.append(el("div", {}, el("b", {textContent: p + " "}), k.set ? `set (...${k.last4}, from ${k.source}) ` : "not set ", inp,
+      el("button", {textContent: "Save", on: {click: async () => { if (inp.value) { await api("/api/settings/keys", jsonOpts("PUT", {[p]: inp.value})); inp.value = ""; loadSettings(); } }}}),
+      k.set && k.source === "config" ? el("button", {textContent: "Remove", on: {click: async () => { await api("/api/settings/keys/" + p, {method: "DELETE"}); loadSettings(); }}}) : ""));
+  }
+}
+$("settings").onsubmit = async ev => {
+  ev.preventDefault();
+  try {
+    await api("/api/settings", jsonOpts("PUT", {voice: $("sVoice").value, speed: +$("sSpeed").value, format: $("sFormat").value,
+      watch_inbox: $("sInbox").value, donate_url: $("sDonate").value, llm_order: $("sOrder").value.split(",").map(x => x.trim()).filter(Boolean)}));
+    $("sMsg").textContent = "saved"; loadSettings();
+  } catch (e) { $("sMsg").textContent = e.message; }
+};
+$("hear").onclick = () => { $("sample").src = `/api/voices/${$("voice").value}/sample?speed=${$("speed").value}`; $("sample").play().catch(() => {}); };
+$("upload").onsubmit = async ev => {
+  ev.preventDefault();
+  const fd = new FormData();
+  fd.append("file", $("file").files[0]); fd.append("voice", $("voice").value); fd.append("speed", $("speed").value);
+  fd.append("format", $("format").value); fd.append("llm", $("llm").checked ? "on" : "off");
+  $("upMsg").textContent = "uploading...";
+  try { const r = await api("/api/books", {method: "POST", body: fd}); $("upMsg").textContent = "queued (job " + r.job_id + ")"; refresh(); }
+  catch (e) { $("upMsg").textContent = e.message; }
+};
+
+async function refresh() {
+  const books = await api("/api/books"), box = $("books");
+  box.replaceChildren(...books.map(renderBook));
+  if (open != null) loadChapters(open);
+}
+function renderBook(b) {
+  const j = b.job, div = el("div", {className: "book", id: "book" + b.id});
+  div.append(el("b", {textContent: b.title}), ` ${b.author} `, el("span", {className: "muted", textContent: `[${b.status}${j && j.state !== "done" ? " / " + j.state : ""}] ${b.chapters_ready || 0}/${b.chapters_total || 0} chapters`}));
+  if (j && !["done", "failed", "cancelled", "queued"].includes(j.state)) div.append(" ", el("progress", {max: 1, value: j.progress || 0}), j.eta ? el("span", {className: "muted", textContent: " ~" + fmtDur(j.eta) + " left"}) : "");
+  if (b.error) div.append(el("div", {className: "err", textContent: b.error}));
+  const bar = el("div");
+  bar.append(el("button", {textContent: "Chapters", on: {click: () => { open = open === b.id ? null : b.id; refresh(); }}}));
+  if (j && ["queued", "extracting", "ocr", "cleaning", "voicing", "assembling"].includes(j.state)) bar.append(el("button", {textContent: "Cancel", on: {click: async () => { await api(`/api/jobs/${j.id}/cancel`, {method: "POST"}); refresh(); }}}));
+  if (j && ["failed", "cancelled"].includes(j.state)) bar.append(el("button", {textContent: "Retry", on: {click: async () => { await api(`/api/jobs/${j.id}/retry`, {method: "POST"}); refresh(); }}}));
+  if (b.download_kind === "m4b") bar.append(el("a", {href: `/api/books/${b.id}/download?format=m4b`, textContent: "M4B "}));
+  if (b.chapters_ready) bar.append(el("a", {href: `/api/books/${b.id}/download?format=zip`, textContent: "ZIP "}));
+  bar.append(el("button", {textContent: "Delete", on: {click: async () => { if (confirm("Move this book to the trash?")) { await api("/api/books/" + b.id, {method: "DELETE"}); refresh(); } }}}));
+  div.append(bar);
+  if (open === b.id) div.append(el("div", {id: "chapters" + b.id}));
+  return div;
+}
+async function loadChapters(id) {
+  const b = await api("/api/books/" + id), box = $("chapters" + id); if (!box) return;
+  const ul = el("ul");
+  for (const c of b.chapters) {
+    const li = el("li", {}, `${c.index + 1}. ${c.title} `, el("span", {className: "muted", textContent: `[${c.status}${c.duration ? " " + fmtDur(c.duration) : ""}] `}));
+    if (c.status === "ready") {
+      const a = el("audio", {controls: true, preload: "none", src: `/api/books/${id}/chapters/${c.index}/audio`});
+      a.addEventListener("timeupdate", () => { if (!a.paused && Math.floor(a.currentTime) % 5 === 0) api(`/api/books/${id}/playback`, jsonOpts("PUT", {chapter: c.index, position: a.currentTime})).catch(() => {}); });
+      li.append(a);
+    }
+    ul.append(li);
+  }
+  box.replaceChildren(ul);
+}
+function listen() {
+  const es = new EventSource("/api/events");
+  let t = null; const later = () => { clearTimeout(t); t = setTimeout(refresh, 300); };
+  for (const ev of ["job", "book", "chapter", "done", "failed", "cancelled", "deleted", "progress"]) es.addEventListener(ev, e => {
+    if (ev === "progress") { const d = JSON.parse(e.data), p = document.querySelector("#book" + d.book_id + " progress"); if (p) p.value = d.progress; else later(); }
+    else later();
+  });
+}
+start().catch(() => {});
+</script>
+</body>
+</html>

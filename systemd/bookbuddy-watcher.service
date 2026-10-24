@@ -1,0 +1,15 @@
+[Unit]
+Description=Book Buddy folder watcher (books dropped in the inbox become audiobooks)
+After=default.target
+
+[Service]
+Type=simple
+# install.sh replaces @BOOKBUDDY@ with the absolute path of your `bookbuddy` executable
+ExecStart=@BOOKBUDDY@ watch
+Restart=on-failure
+RestartSec=30
+Nice=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

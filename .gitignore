@@ -1,0 +1,11 @@
+.venv/
+work/
+models/
+__pycache__/
+*.pyc
+tests/fixtures/*.m4b
+logs/
+*.egg-info/
+tests/fixtures/alice-images.epub
+.pytest_cache/
+cache/
