@@ -29,10 +29,18 @@ async function api(path, opts = {}) {
   if (!r.ok) {
     let m = r.statusText;
     try { const j = await r.json(); m = typeof j.detail === "string" ? j.detail : m; } catch { /* keep status text */ }
-    const e = new Error(m); e.status = r.status; throw e;
+    const e = new Error(friendly(m)); e.status = r.status; throw e;
   }
   return r.status === 204 ? null : r.json();
 }
+// API errors are written for developers; show people plain sentences (no setting names, capital first letter).
+const FRIENDLY = {
+  "watch_inbox must be a folder path": "Choose a folder for the inbox.",
+  "watch_outbox must be a folder path": "Choose a folder for finished books.",
+  "output_dir must be a folder path": "Choose a folder for finished books.",
+  "that does not look like an API key": "That doesn't look like an API key.",
+};
+function friendly(m) { m = String(m || ""); return FRIENDLY[m] || (m.charAt(0).toUpperCase() + m.slice(1)); }
 const jsonOpts = (method, body) => ({ method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
 function fmtHM(sec) {
@@ -187,8 +195,8 @@ function statusLine(b) {
     default: return "Working";
   }
 }
-let openMenu = null;
-function closeMenu() { if (openMenu) { openMenu.remove(); openMenu = null; } }
+let openMenu = null, shelfDirty = false;
+function closeMenu() { if (openMenu) { openMenu.remove(); openMenu = null; if (shelfDirty) renderShelf(); } }
 document.addEventListener("click", e => { if (openMenu && !openMenu.contains(e.target) && !e.target.closest(".more")) closeMenu(); });
 function shelfMenu(b, anchor) {
   closeMenu();
@@ -208,26 +216,38 @@ function shelfMenu(b, anchor) {
   menu.querySelector("button").focus();
 }
 function renderShelf() {
+  // Live updates must not yank an open menu or keyboard focus away: wait for the menu, then put focus back.
+  if (openMenu) { shelfDirty = true; return; }
+  shelfDirty = false;
   const shelf = $("shelf");
   $("shelfLoading").hidden = true;
   $("shelfEmpty").hidden = S.books.length > 0;
-  closeMenu();
+  const a = document.activeElement, focusRow = shelf.contains(a) ? a.closest(".item")?.dataset.id : null;
+  const focusKind = focusRow ? (a.classList.contains("more") ? ".more" : "a.btn") : null;
   shelf.replaceChildren(...S.books.map(b => {
     const j = b.job, active = j && ACTIVE.has(j.state) && b.status !== "ready";
     const failed = b.status === "failed";
     const t = el("div", { class: "t" }, el("b", { textContent: b.title, title: b.title }),
-      el("div", { class: "muted" + (failed ? " err-line" : ""), textContent: statusLine(b) }));
+      el("div", { class: "muted st" + (failed ? " err-line" : ""), textContent: statusLine(b) }));
     if (active && j.state === "voicing") t.append(el("div", { class: "prog" }, el("i", { style: `width:${Math.round((j.progress || 0) * 100)}%` })));
     const more = el("button", { class: "more", type: "button", title: "More", attrs: { "aria-label": `More for ${b.title}`, "aria-haspopup": "menu" },
       textContent: "⋯", on: { click: () => shelfMenu(b, more) } });
     const canOpen = b.chapters_ready > 0;
-    return el("div", { class: "item", attrs: { role: "listitem" } }, coverEl(b, "sm"), t,
+    return el("div", { class: "item", dataset: { id: String(b.id) }, attrs: { role: "listitem" } }, coverEl(b, "sm"), t,
       canOpen ? el("a", { class: "btn s", href: `#book/${b.id}`, textContent: "Open", attrs: { "aria-label": `Open ${b.title}` } }) : null, more);
   }));
+  if (focusRow) shelf.querySelector(`.item[data-id="${focusRow}"] ${focusKind}`)?.focus();
   relayout();
+}
+function patchProgress(b) {   // progress ticks: update the line + bar in place instead of rebuilding the shelf
+  const row = $("shelf").querySelector(`.item[data-id="${b.id}"]`), bar = row && row.querySelector(".prog i");
+  if (!bar) return renderShelf();
+  row.querySelector(".st").textContent = statusLine(b);
+  bar.style.width = `${Math.round((b.job.progress || 0) * 100)}%`;
 }
 async function loadBooks() {
   S.books = await api("/api/books");
+  if (P.playingBook && !S.books.some(b => b.id === P.playingBook.id)) stopPlayer();   // its book was deleted
   renderShelf();
   if (S.detailId != null && body.classList.contains("view-book")) loadDetail(S.detailId, false);
 }
@@ -244,7 +264,7 @@ function listen() {
   es.addEventListener("progress", e => {
     let d; try { d = JSON.parse(e.data); } catch { return; }
     const b = S.books.find(x => x.id === d.book_id);
-    if (b && b.job) { b.job.progress = d.progress; b.job.eta = d.eta; renderShelf(); }
+    if (b && b.job) { b.job.progress = d.progress; b.job.eta = d.eta; patchProgress(b); }
   });
   es.onerror = () => {
     if (es.readyState === EventSource.CLOSED) { clearTimeout(esTimer); esTimer = setTimeout(listen, 3000); }
@@ -535,6 +555,11 @@ function updatePlayer() {
   $("plLink").href = `#book/${b.id}`;
 }
 
+function stopPlayer() {
+  P.playingBook = null; P.book = null; P.cur = -1;          // cleared first, so the pause below saves nothing
+  audio.pause(); audio.removeAttribute("src"); delete audio.dataset.book; audio.load();
+  body.classList.remove("playing"); updatePlayIcon(); relayout();
+}
 function savePosition(force) {
   const b = P.playingBook; if (!b || P.cur < 0 || !audio.src) return;
   const now = Date.now();
@@ -582,6 +607,8 @@ scrub.addEventListener("pointermove", e => { if (scrubbing) scrubTo(e.clientX); 
 scrub.addEventListener("pointerup", () => { scrubbing = false; savePosition(true); });
 scrub.addEventListener("keydown", e => {
   if (e.key === "ArrowRight") { seekBy(10); e.preventDefault(); } else if (e.key === "ArrowLeft") { seekBy(-10); e.preventDefault(); }
+  else if (e.key === "Home" && audio.src) { audio.currentTime = 0; updateTimes(); e.preventDefault(); }
+  else if (e.key === "End" && audio.src && audio.duration) { audio.currentTime = Math.max(0, audio.duration - 1); updateTimes(); e.preventDefault(); }
 });
 // speed, sleep timer, bookmark
 $("speedChip").addEventListener("click", () => {
